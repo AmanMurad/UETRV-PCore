@@ -31,36 +31,59 @@ FILES = {
     "expected_4M": os.path.join(DATA_DIR, "expected_4M.txt")
 }
 GEN = 0 # Set 1 for generating data, 0 for testing
-
+SUPERPAGE = 0
 # Utility Functions
 def generate_random_address():
     return random.randint(0x80000000, 0x8007FFFF)
 
-def generate_random_data_1():
-    binary = bin(random.randint(0x08200000, 0x082000ff))
-    if (binary[27]=="0" and binary[29]=="0"):
-        binary = binary[:30] + "01"
-    else:
-       binary = binary[:30] + "11"  
-    return int(binary,2)
-    
-def generate_random_data_2():
-    binary = bin(random.randint(0x08300000, 0x083000ff))
-    
-    binary = binary[:28] + "11"
-    return int(binary,2)
+def generate_random_data_1(SUPERPAGE=0):
+    binary = bin(random.randint(0x08200000, 0x082000ff))[2:].zfill(32)
 
-def generate_expected_PA(pte_data,address,exp_4M):
-    PA_addr = int(str("000000"+bin(int(pte_data, 16))[2:][0:18] + bin(int(address, 16))[2:][20:32]),2)
-    if (int(exp_4M,16)==1):
-        PA_addr=int(bin(PA_addr)[2:][0:12]+bin(int(address, 16))[2:][12:32],2)
+    if SUPERPAGE == 0:
+        binary = binary[:28] + "0001"   # force last 4 bits, non-superpage case
+
+    # SUPERPAGE == 1 skips the line above entirely, leaving the last 4 bits
+    # as whatever the random value naturally produced
+
+    binary_list = list(binary)
+
+    binary_list[-7] = "1"
+
+    if binary_list[-4] == "1" and binary_list[-2] == "0":
+        binary_list[-2] = "1"
+
+    binary = "".join(binary_list)
+    return int(binary, 2)
+def generate_random_data_2():
+    binary = bin(random.randint(0x08300000, 0x083000ff))[2:].zfill(32)
+    binary_list = list(binary)
+
+    binary_list[-7] = "1"
+    binary = "".join(binary_list)
+
+    binary = binary[:30] + "11"   # first 30 bits (now correctly padded) + fixed "11" suffix = 32 bits
+
+    return int(binary, 2)
+def generate_expected_PA(pte_data, address, exp_4M):
+    pte_bin  = bin(int(pte_data, 16))[2:].zfill(32)   # full pte word, MSB-first
+    addr_bin = bin(int(address, 16))[2:].zfill(32)    # full vaddr, MSB-first
+
+    # ppn = pte_bin[0:22]   -> bits [31:10] of pte_data (matches struct: ppn is top 22 bits)
+    # vaddr[11:0] = addr_bin[20:32] -> page offset
+    PA_addr = int(pte_bin[0:22] + addr_bin[20:32], 2)
+
+    if int(exp_4M, 16) == 1:
+        # Superpage: override paddr[21:0] with vaddr[21:0], keep top 12 bits (ppn[21:10]) of PA_addr
+        pa_bin = bin(PA_addr)[2:].zfill(34)           # PA is 34 bits (22-bit ppn + 12-bit offset)
+        PA_addr = int(pa_bin[0:12] + addr_bin[10:32], 2)
+
     return PA_addr
 
 def generate_4M_signal(pte_data):
-    if (bin(int(pte_data,16))[2:][-4:]!="0001"):
-        return 1
-    else:
+    if (bin(int(pte_data,16))[2:][-4:]=="0001"):
         return 0
+    else:
+        return 1
 
 def save_to_file(filename, data_list):
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -115,7 +138,7 @@ async def memory_operations_test(dut):
         pte_1=[pte_1_data_values[i][8:] for i in range(100)]
         #logger.info(pte_1)
         expected_4M_values = [hex(generate_4M_signal(pte_1_data_values[i])) for i in range(100)]
-        for i in range(10):
+        for i in range(100):
             #logger.info(pte_1[i][8:])
             if (int(expected_4M_values[i],16)==1):
                 expected_PA_addresses = [bin(generate_expected_PA(pte_1_data_values[i],addresses[i],expected_4M_values[i])) for i in range(100)]
@@ -147,42 +170,31 @@ async def memory_operations_test(dut):
     # ----------------------------------------------------------------------
 
     for idx, (addr, data1, data2, exp_PA, exp_4M) in enumerate(zip(addresses, data_1_values, data_2_values, expected_PA, expected_4M)):
-        await RisingEdge(dut.clk)
 
-        dut.lsu2mmu_i.value = int(hex(int("1000110011111000011000",2)) + 'c4' + addr[2:],16)
-        await RisingEdge(dut.clk)
         for _ in range(5):
             await RisingEdge(dut.clk)
-        dut.dcache2mmu_i.value = int(bin(int(data1[2:],16)) + "1",2)
-        for _ in range(2):
-            await RisingEdge(dut.clk)
+
         if (int(exp_4M,16)==1):
-            dut.lsu2mmu_i.value = int(hex(int("1000110011111000011000",2)) + '44' + addr[2:],16)
+            dut.lsu2mmu_i.value = int(hex(int("1000110011111000011000",2)) + '64' + addr[2:],16)
+            await RisingEdge(dut.clk)
+            dut.dcache2mmu_i.value = int(bin(int(data1[2:],16)) + "1",2)
             await RisingEdge(dut.clk)
             dut.dcache2mmu_i.value = int(bin(int(data1[2:],16)) + "0",2)
             for _ in range(10):
                 await RisingEdge(dut.clk)
         else:
-            dut.dcache2mmu_i.value = int(bin(int(data2[2:],16)) + "1",2)
-            for _ in range(2):
-                await RisingEdge(dut.clk)
-            dut.lsu2mmu_i.value = int(hex(int("1000110011111000011000",2)) + '44' + addr[2:],16)
+            dut.lsu2mmu_i.value = int(hex(int("1000110011111000011000",2)) + '64' + addr[2:],16)
             await RisingEdge(dut.clk)
-            dut.dcache2mmu_i.value = int(bin(int(data2[2:],16)) + "0",2)
+            dut.dcache2mmu_i.value = int(bin(int(data1[2:],16)) + "1",2)
+            await RisingEdge(dut.clk)
+            dut.dcache2mmu_i.value = int(bin(int(data2[2:],16)) + "1",2)
+            await RisingEdge(dut.clk)
+            
             for _ in range(10):
                 await RisingEdge(dut.clk)
-        actual_result=bin(dut.mmu2lsu_o.value)[:34]
-        logger.info(exp_PA)
-        logger.info(actual_result)
-        if (bin(int(data1,16))[2:][::-1][6]=="1") & (int(exp_4M,16)==1):
-            if (hex(int(exp_PA,2))==hex(int(actual_result,2))):
-                print("PASS")
-            else:
-                print("FAIL")
-        if (bin(int(data2,16))[2:][::-1][6]=="1") & (int(exp_4M,16)!=1):
-            actual_result=bin(dut.mmu2lsu_o.value)[:32]
-            if (exp_PA==actual_result):
-                print("PASS")
-            else:
-                print("FAIL")
-
+            dut.dcache2mmu_i.value = int(bin(int(data2[2:],16)) + "0",2)
+        actual_result=bin(dut.mmu2lsu_o.value)[:-3]
+        if (hex(int(exp_PA,2))==hex(int(actual_result,2))):
+            print("PASS")
+        else:
+            print("FAIL")
